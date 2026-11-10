@@ -1,0 +1,22 @@
+name: pr-stale
+on:
+  schedule:
+    - cron: '30 1 * * *'
+
+permissions: {}
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      with:
+        egress-policy: audit
+    - uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629 # v10.4.0
+      with:
+        days-before-close: '120'
+        stale-pr-label: stale
+        repo-token: ${{ github.token }}

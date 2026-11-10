@@ -1,0 +1,28 @@
+name: pr-actions
+
+permissions: {}
+
+on:
+  pull_request:
+    branches:
+    - master
+    - main
+
+jobs:
+  ensure-sha-pinned:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Ensure SHA pinned actions
+        uses: zgosalvez/github-actions-ensure-sha-pinned-actions@76ed8a4c86957c2d27d44bab47f172193149d926 # v5.0.11
+        with:
+          # slsa-github-generator requires using a semver tag for reusable workflows. 
+          # See: https://github.com/slsa-framework/slsa-github-generator#referencing-slsa-builders-and-generators
+          allowlist: |
+            slsa-framework/slsa-github-generator
