@@ -3,7 +3,9 @@ package collector
 
 import (
 	"context"
+	"fmt"
 	"regexp"
+	"sync"
 
 	helmapi "github.com/fluxcd/helm-controller/api/v2"
 	ksapi "github.com/fluxcd/kustomize-controller/api/v1"
@@ -21,17 +23,40 @@ const (
 	fluxKustomizeNamespaceLabel = "kustomize.toolkit.fluxcd.io/namespace"
 )
 
+// Manager identifies the gitops manager which claims ownership of a resource.
+type Manager struct {
+	Kind      string
+	Name      string
+	Namespace string
+}
+
+// String returns a human readable identifier of the manager.
+func (m Manager) String() string {
+	return fmt.Sprintf("%s %s/%s", m.Kind, m.Namespace, m.Name)
+}
+
+// DualClaim describes a resource which is claimed by more than one gitops manager.
+type DualClaim struct {
+	Resource unstructured.Unstructured
+	Managers []Manager
+}
+
 // FilterFunc is a function that filters resources.
-type FilterFunc func(res unstructured.Unstructured, logger klog.Logger) bool
+// It returns true if the resource is filtered (i.e. not considered a zombie)
+// and the gitops manager which claims the resource, if any.
+type FilterFunc func(res unstructured.Unstructured, logger klog.Logger) (bool, Manager)
 
 // Interface represents collector interface.
 type Interface interface {
 	Discover(ctx context.Context, list *unstructured.UnstructuredList, ch chan unstructured.Unstructured) error
+	DualClaims() []DualClaim
 }
 
 type discovery struct {
-	filters []FilterFunc
-	logger  klog.Logger
+	filters    []FilterFunc
+	logger     klog.Logger
+	mu         sync.Mutex
+	dualClaims []DualClaim
 }
 
 // NewDiscovery returns a new discovery instance.
@@ -43,19 +68,43 @@ func NewDiscovery(logger klog.Logger, filters ...FilterFunc) Interface {
 }
 
 // Discover validates discovered resources against all filters and adds it to consumer channel.
+// Resources claimed by more than one gitops manager are collected as dual claims.
 func (d *discovery) Discover(
 	_ context.Context,
 	list *unstructured.UnstructuredList,
 	ch chan unstructured.Unstructured,
 ) error {
-RESOURCES:
 	for _, res := range list.Items {
 		d.logger.V(1).Info("validate resource", "name", res.GetName(), "namespace", res.GetNamespace(), "apiVersion", res.GetAPIVersion())
 
+		var (
+			filtered bool
+			managers []Manager
+		)
+
 		for _, filter := range d.filters {
-			if filter(res, d.logger) {
-				continue RESOURCES
+			ok, manager := filter(res, d.logger)
+			if !ok {
+				continue
 			}
+
+			filtered = true
+			if manager.Kind != "" {
+				managers = append(managers, manager)
+			}
+		}
+
+		if len(managers) > 1 {
+			d.logger.V(1).
+				Info("resource is claimed by multiple gitops managers", "name", res.GetName(), "namespace", res.GetNamespace(), "apiVersion", res.GetAPIVersion(), "managers", fmt.Sprintf("%v", managers))
+
+			d.mu.Lock()
+			d.dualClaims = append(d.dualClaims, DualClaim{Resource: res, Managers: managers})
+			d.mu.Unlock()
+		}
+
+		if filtered {
+			continue
 		}
 
 		ch <- res
@@ -64,53 +113,61 @@ RESOURCES:
 	return nil
 }
 
+// DualClaims returns all resources which are claimed by more than one gitops manager.
+func (d *discovery) DualClaims() []DualClaim {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return append([]DualClaim(nil), d.dualClaims...)
+}
+
 // IgnoreOwnedResource returns a FilterFunc which filters resources owner by parents ones.
 func IgnoreOwnedResource() FilterFunc {
-	return func(res unstructured.Unstructured, logger klog.Logger) bool {
+	return func(res unstructured.Unstructured, logger klog.Logger) (bool, Manager) {
 		if refs := res.GetOwnerReferences(); len(refs) > 0 {
 			logger.V(1).
 				Info("ignore resource owned by parent", "name", res.GetName(), "namespace", res.GetNamespace(), "apiVersion", res.GetAPIVersion())
-			return true
+			return true, Manager{}
 		}
 
-		return false
+		return false, Manager{}
 	}
 }
 
 // IgnoreServiceAccountSecret returns a FilterFunc which filters secrets linked to a service account.
 func IgnoreServiceAccountSecret() FilterFunc {
-	return func(res unstructured.Unstructured, _ klog.Logger) bool {
+	return func(res unstructured.Unstructured, _ klog.Logger) (bool, Manager) {
 		if res.GetKind() == "Secret" && res.GetAPIVersion() == "v1" {
 			if _, ok := res.GetAnnotations()["kubernetes.io/service-account.name"]; ok {
-				return true
+				return true, Manager{}
 			}
 		}
 
-		return false
+		return false, Manager{}
 	}
 }
 
 // IgnoreHelmSecret returns a FilterFunc which filters secrets owned by helm.
 func IgnoreHelmSecret() FilterFunc {
-	return func(res unstructured.Unstructured, _ klog.Logger) bool {
+	return func(res unstructured.Unstructured, _ klog.Logger) (bool, Manager) {
 		if res.GetKind() == "Secret" && res.GetAPIVersion() == "v1" {
 			if v, ok := res.GetLabels()["owner"]; ok && v == "helm" {
-				return true
+				return true, Manager{}
 			}
 		}
 
-		return false
+		return false, Manager{}
 	}
 }
 
 // IgnoreIfHelmReleaseFound returns a FilterFunc which filters resources part of an helm release.
 func IgnoreIfHelmReleaseFound(helmReleases []helmapi.HelmRelease) FilterFunc {
-	return func(res unstructured.Unstructured, logger klog.Logger) bool {
+	return func(res unstructured.Unstructured, logger klog.Logger) (bool, Manager) {
 		labels := res.GetLabels()
 		if helmName, ok := labels[fluxHelmNameLabel]; ok {
 			if helmNamespace, ok := labels[fluxHelmNamespaceLabel]; ok {
 				if hasResource(helmReleases, helmName, helmNamespace) {
-					return true
+					return true, Manager{Kind: "HelmRelease", Name: helmName, Namespace: helmNamespace}
 				}
 
 				logger.V(1).
@@ -118,18 +175,18 @@ func IgnoreIfHelmReleaseFound(helmReleases []helmapi.HelmRelease) FilterFunc {
 			}
 		}
 
-		return false
+		return false, Manager{}
 	}
 }
 
 // IgnoreIfKustomizationFound returns a FilterFunc which filters resources part of a flux kustomization.
 func IgnoreIfKustomizationFound(kustomizations []ksapi.Kustomization) FilterFunc {
-	return func(res unstructured.Unstructured, logger klog.Logger) bool {
+	return func(res unstructured.Unstructured, logger klog.Logger) (bool, Manager) {
 		labels := res.GetLabels()
 		ksName, okKsName := labels[fluxKustomizeNameLabel]
 		ksNamespace, okKsNamespace := labels[fluxKustomizeNamespaceLabel]
 		if !okKsName || !okKsNamespace {
-			return false
+			return false, Manager{}
 		}
 
 		if ks := findKustomization(kustomizations, ksName, ksNamespace); ks != nil {
@@ -146,24 +203,24 @@ func IgnoreIfKustomizationFound(kustomizations []ksapi.Kustomization) FilterFunc
 			if ks.Status.Inventory != nil {
 				for _, entry := range ks.Status.Inventory.Entries {
 					if entry.ID == id {
-						return true
+						return true, Manager{Kind: "Kustomization", Name: ksName, Namespace: ksNamespace}
 					}
 				}
 			}
 
 			logger.V(1).
 				Info("resource is not part of the kustomization inventory", "name", res.GetName(), "namespace", res.GetNamespace(), "apiVersion", res.GetAPIVersion(), "kustomizationName", ksName, "kustomizationNamespace", ksNamespace)
-			return false
+			return false, Manager{}
 		}
 		logger.V(1).
 			Info("kustomization not found from resource", "resource", res.GetName(), "namespace", res.GetNamespace(), "apiVersion", res.GetAPIVersion(), "kustomizationName", ksName, "kustomizationNamespace", ksNamespace)
-		return false
+		return false, Manager{}
 	}
 }
 
 // IgnoreRuleExclusions returns a FilterFunc which excludes resources part of configuration exclusions.
 func IgnoreRuleExclusions(cluster string, exclusions []v1.ExcludeResources) FilterFunc {
-	return func(res unstructured.Unstructured, _ klog.Logger) bool {
+	return func(res unstructured.Unstructured, _ klog.Logger) (bool, Manager) {
 		for _, exclusion := range exclusions {
 			if !matchesCluster(cluster, exclusion.Cluster) {
 				continue
@@ -186,10 +243,10 @@ func IgnoreRuleExclusions(cluster string, exclusions []v1.ExcludeResources) Filt
 			}
 
 			if resourceMatchesName(res, exclusion.Name) {
-				return true
+				return true, Manager{}
 			}
 		}
-		return false
+		return false, Manager{}
 	}
 }
 

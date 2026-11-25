@@ -34,6 +34,7 @@ type clusterDetectionResult struct {
 	cluster       string
 	resourceCount int
 	zombies       []unstructured.Unstructured
+	dualClaims    int
 }
 
 type clusterClients struct {
@@ -90,13 +91,13 @@ func New(
 }
 
 // DetectZombies detects all workload not managed by gitops.
-func (d *Detector) DetectZombies() (resourceCount int, zombies map[string][]unstructured.Unstructured, err error) {
+func (d *Detector) DetectZombies() (resourceCount int, zombies map[string][]unstructured.Unstructured, dualClaims int, err error) {
 	zombies = make(map[string][]unstructured.Unstructured)
 	ch := make(chan clusterDetectionResult)
 
-	helmReleases, kustomizations, clustersConfigs, err := d.listGitopsResources()
+	helmReleases, kustomizations, applications, clustersConfigs, err := d.listGitopsResources()
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 
 	var wg sync.WaitGroup
@@ -112,10 +113,11 @@ func (d *Detector) DetectZombies() (resourceCount int, zombies map[string][]unst
 		go func(cluster string) {
 			defer wg.Done()
 
-			clusterResourceCount, clusterZombies, err := d.detectZombiesOnCluster(
+			clusterResourceCount, clusterZombies, clusterDualClaims, err := d.detectZombiesOnCluster(
 				cluster,
 				helmReleases,
 				kustomizations,
+				applications,
 				clustersConfigs[cluster].dynamic,
 				clustersConfigs[cluster].discovery,
 			)
@@ -126,6 +128,7 @@ func (d *Detector) DetectZombies() (resourceCount int, zombies map[string][]unst
 				cluster:       cluster,
 				resourceCount: clusterResourceCount,
 				zombies:       clusterZombies,
+				dualClaims:    clusterDualClaims,
 			}
 		}(cluster)
 	}
@@ -137,10 +140,11 @@ func (d *Detector) DetectZombies() (resourceCount int, zombies map[string][]unst
 
 	for res := range ch {
 		resourceCount += res.resourceCount
+		dualClaims += res.dualClaims
 		zombies[res.cluster] = res.zombies
 	}
 
-	return resourceCount, zombies, nil
+	return resourceCount, zombies, dualClaims, nil
 }
 
 // PrintZombies prints all workload not managed by gitops.
@@ -172,9 +176,10 @@ func (d *Detector) detectZombiesOnCluster(
 	clusterName string,
 	helmReleases []helmapi.HelmRelease,
 	kustomizations []ksapi.Kustomization,
+	applications []unstructured.Unstructured,
 	clusterDynClient dynamic.Interface,
 	clusterDiscoveryClient *discovery.DiscoveryClient,
-) (int, []unstructured.Unstructured, error) {
+) (int, []unstructured.Unstructured, int, error) {
 	var (
 		resourceCount int
 		zombies       []unstructured.Unstructured
@@ -187,6 +192,7 @@ func (d *Detector) detectZombiesOnCluster(
 		collector.IgnoreHelmSecret(),
 		collector.IgnoreIfHelmReleaseFound(helmReleases),
 		collector.IgnoreIfKustomizationFound(kustomizations),
+		collector.IgnoreIfApplicationFound(applications),
 		collector.IgnoreRuleExclusions(clusterName, d.conf.ExcludeResources),
 	)
 
@@ -194,7 +200,7 @@ func (d *Detector) detectZombiesOnCluster(
 	klog.V(1).Infof("[%s] discover all api groups and resources", clusterName)
 	list, err := listServerGroupsAndResources(clusterDiscoveryClient)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	for _, g := range list {
 		klog.V(1).Infof("[%s] found group %v with the following resources", clusterName, g.GroupVersion)
@@ -213,7 +219,7 @@ func (d *Detector) detectZombiesOnCluster(
 		klog.V(1).Infof("[%s] discover resource group %#v", clusterName, group.GroupVersion)
 		gv, err := schema.ParseGroupVersion(group.GroupVersion)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, 0, err
 		}
 
 		for _, resource := range group.APIResources {
@@ -258,14 +264,32 @@ func (d *Detector) detectZombiesOnCluster(
 	close(ch)
 	wgConsumer.Wait()
 
-	return resourceCount, zombies, nil
+	dualClaims := discover.DualClaims()
+	for _, dualClaim := range dualClaims {
+		managers := make([]string, 0, len(dualClaim.Managers))
+		for _, manager := range dualClaim.Managers {
+			managers = append(managers, manager.String())
+		}
+
+		klog.V(1).
+			Infof("[%s] resource %s %s %s.%s is claimed by multiple gitops managers: %v",
+				clusterName,
+				dualClaim.Resource.GetAPIVersion(),
+				dualClaim.Resource.GetKind(),
+				dualClaim.Resource.GetName(),
+				dualClaim.Resource.GetNamespace(),
+				managers,
+			)
+	}
+
+	return resourceCount, zombies, len(dualClaims), nil
 }
 
-func (d *Detector) listGitopsResources() ([]helmapi.HelmRelease, []ksapi.Kustomization, map[string]clusterClients, error) {
+func (d *Detector) listGitopsResources() ([]helmapi.HelmRelease, []ksapi.Kustomization, []unstructured.Unstructured, map[string]clusterClients, error) {
 	klog.V(1).Infof("discover all helmreleases")
 	helmReleases, err := listHelmReleases(context.TODO(), d.gitopsDynClient, d.getLabelSelector())
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to get helmreleases: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to get helmreleases: %w", err)
 	}
 	for _, h := range helmReleases {
 		klog.V(1).Infof(" |_ %s.%s", h.GetName(), h.GetNamespace())
@@ -274,11 +298,21 @@ func (d *Detector) listGitopsResources() ([]helmapi.HelmRelease, []ksapi.Kustomi
 	klog.V(1).Infof("discover all kustomizations")
 	kustomizations, err := listKustomizations(context.TODO(), d.gitopsRestClient)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to get kustomizations: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to get kustomizations: %w", err)
 	}
 
 	for _, k := range kustomizations {
 		klog.V(1).Infof(" |_ %s.%s", k.GetName(), k.GetNamespace())
+	}
+
+	klog.V(1).Infof("discover all argocd applications")
+	applications, err := listApplications(context.TODO(), d.gitopsDynClient, d.getLabelSelector())
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed to get argocd applications: %w", err)
+	}
+
+	for _, a := range applications {
+		klog.V(1).Infof(" |_ %s.%s", a.GetName(), a.GetNamespace())
 	}
 
 	klog.V(1).Infof("discover all managed clustersClients")
@@ -289,14 +323,14 @@ func (d *Detector) listGitopsResources() ([]helmapi.HelmRelease, []ksapi.Kustomi
 		helmReleases,
 	)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to get managed clustersClients: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to get managed clustersClients: %w", err)
 	}
 
 	for clusterName := range clustersClients {
 		klog.V(1).Infof(" |_ %s", clusterName)
 	}
 
-	return helmReleases, kustomizations, clustersClients, nil
+	return helmReleases, kustomizations, applications, clustersClients, nil
 }
 
 func (d *Detector) getClustersClientsFromKustomizationsAndHelmReleases(

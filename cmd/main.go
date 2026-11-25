@@ -113,7 +113,7 @@ func parseCliArgs() (*cobra.Command, error) {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Short:         "Find kubernetes resources which are not managed by GitOps",
-		Long:          `Finds all kubernetes resources from all installed apis on a kubernetes cluster and evaluates whether they are managed by a flux Kustomization or a HelmRelease.`,
+		Long:          `Finds all kubernetes resources from all installed apis on a kubernetes cluster and evaluates whether they are managed by a flux Kustomization, a HelmRelease or an Argo CD Application.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.Annotations = make(map[string]string)
 			cmd.Annotations[statusAnnotation] = strconv.Itoa(statusFail)
@@ -253,7 +253,7 @@ func run(
 	if err != nil {
 		return statusFail, err
 	}
-	resourceCount, allZombies, err := detect.DetectZombies()
+	resourceCount, allZombies, dualClaims, err := detect.DetectZombies()
 	if err != nil {
 		return statusFail, err
 	}
@@ -271,7 +271,12 @@ func run(
 	}
 
 	if conf.NoStream && printFlags.OutputFormat != nil && *printFlags.OutputFormat == "" {
-		fmt.Printf("\nSummary: %d resources found, %d zombies detected\n", resourceCount, totalZombies)
+		fmt.Printf(
+			"\nSummary: %d resources found, %d zombies detected, %d resources claimed by multiple gitops managers\n",
+			resourceCount,
+			totalZombies,
+			dualClaims,
+		)
 	}
 
 	if conf.Fail && totalZombies > 0 {

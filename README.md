@@ -7,22 +7,23 @@
 [![Coverage Status](https://coveralls.io/repos/github/raffis/gitops-zombies/badge.svg?branch=main)](https://coveralls.io/github/raffis/gitops-zombies?branch=main)
 [![license](https://img.shields.io/github/license/raffis/gitops-zombies.svg)](https://github.com/raffis/gitops-zombies/blob/main/LICENSE)
 
-Find kubernetes resources which are not managed via GitOps (flux2).
+Find kubernetes resources which are not managed via GitOps (flux2 or Argo CD).
 Wether you are migrating to a GitOps workflow or have pruning disabled. This tool will help in either case.
 
 <p align="center"><img src="https://github.com/raffis/gitops-zombies/blob/main/assets/logo.png?raw=true" alt="logo"/></p>
 
 ## How does it work?
 
-gitops-zombies discovers all apis installed on a cluster and identifies resources which are not part of a flux Kustomization or a HelmRelease.
+gitops-zombies discovers all apis installed on a cluster and identifies resources which are not part of a flux Kustomization, a HelmRelease or an Argo CD Application.
 It also acknowledges the following facts:
 
 * Ignores resources which are owned by a parent resource (For example pods which are created by a deployment)
 * Ignores resources which are considered dynamic (metrics, leases, events, endpoints, ...)
 * Filter out resources which are created by the apiserver itself (like default rbacs)
 * Filters secrets which are managed by other parties including helm or ServiceAccount tokens
-* Checks if the referenced HelmRelease or Kustomization exists
-* Checks if resources are still part of the kustomization inventory
+* Checks if the referenced HelmRelease, Kustomization or Argo CD Application exists
+* Checks if resources are still part of the kustomization inventory or the application status resources
+* Reports resources which are claimed by more than one gitops manager in the summary
 * Supports cross cluster kustomizations
 
 
@@ -72,7 +73,7 @@ excludeResources:
 ## CLI reference
 
 ```
-Finds all kubernetes resources from all installed apis on a kubernetes cluste and evaluates whether they are managed by a flux kustomization or a helmrelease.
+Finds all kubernetes resources from all installed apis on a kubernetes cluster and evaluates whether they are managed by a flux Kustomization, a HelmRelease or an Argo CD Application.
 
 Usage:
   gitops-zombies [flags]

@@ -24,10 +24,32 @@ func (l NullLogger) Failuref(_ string, _ ...any) {
 }
 
 type test struct {
-	name         string
-	filters      func() []FilterFunc
-	list         func() *unstructured.UnstructuredList
-	expectedPass int
+	name               string
+	filters            func() []FilterFunc
+	list               func() *unstructured.UnstructuredList
+	expectedPass       int
+	expectedDualClaims int
+}
+
+func argocdApplication(name, namespace string, resources []map[string]any) unstructured.Unstructured {
+	app := unstructured.Unstructured{}
+	app.SetName(name)
+	app.SetNamespace(namespace)
+	app.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "argoproj.io",
+		Version: "v1alpha1",
+		Kind:    "Application",
+	})
+
+	if resources != nil {
+		items := make([]any, 0, len(resources))
+		for _, res := range resources {
+			items = append(items, res)
+		}
+		_ = unstructured.SetNestedSlice(app.Object, items, "status", "resources")
+	}
+
+	return app
 }
 
 func getExclusionListResourceSet() *unstructured.UnstructuredList {
@@ -456,6 +478,260 @@ func TestDiscovery(t *testing.T) {
 			list:         getExclusionListResourceSet,
 			expectedPass: 1,
 		},
+		{
+			name: "A resource which is listed in the status resources of an argocd application is ignored",
+			filters: func() []FilterFunc {
+				applications := []unstructured.Unstructured{
+					argocdApplication("my-app", "argocd", []map[string]any{
+						{
+							"group":     "apps",
+							"kind":      "Deployment",
+							"namespace": "test",
+							"name":      "nginx",
+						},
+					}),
+				}
+
+				return []FilterFunc{IgnoreIfApplicationFound(applications)}
+			},
+			list: func() *unstructured.UnstructuredList {
+				list := &unstructured.UnstructuredList{}
+				expected := unstructured.Unstructured{}
+				expected.SetName("resource")
+
+				notExpected := unstructured.Unstructured{}
+				notExpected.SetGroupVersionKind(schema.GroupVersionKind{
+					Group:   "apps",
+					Version: "v1",
+					Kind:    "Deployment",
+				})
+				notExpected.SetNamespace("test")
+				notExpected.SetName("nginx")
+				notExpected.SetLabels(map[string]string{
+					argocdInstanceLabel: "my-app",
+				})
+
+				list.Items = append(list.Items, expected, notExpected)
+				return list
+			},
+			expectedPass: 1,
+		},
+		{
+			name: "A resource with only the argocd instance label but no matching application is not ignored",
+			filters: func() []FilterFunc {
+				return []FilterFunc{IgnoreIfApplicationFound(nil)}
+			},
+			list: func() *unstructured.UnstructuredList {
+				list := &unstructured.UnstructuredList{}
+				expected := unstructured.Unstructured{}
+				expected.SetGroupVersionKind(schema.GroupVersionKind{
+					Group:   "apps",
+					Version: "v1",
+					Kind:    "Deployment",
+				})
+				expected.SetNamespace("test")
+				expected.SetName("nginx")
+				expected.SetLabels(map[string]string{
+					argocdInstanceLabel: "my-app",
+				})
+
+				list.Items = append(list.Items, expected)
+				return list
+			},
+			expectedPass: 1,
+		},
+		{
+			name: "A resource is not ignored if the application exists but does not list it in its status resources",
+			filters: func() []FilterFunc {
+				applications := []unstructured.Unstructured{
+					argocdApplication("my-app", "argocd", []map[string]any{
+						{
+							"group":     "apps",
+							"kind":      "Deployment",
+							"namespace": "test",
+							"name":      "other",
+						},
+					}),
+				}
+
+				return []FilterFunc{IgnoreIfApplicationFound(applications)}
+			},
+			list: func() *unstructured.UnstructuredList {
+				list := &unstructured.UnstructuredList{}
+				expected := unstructured.Unstructured{}
+				expected.SetGroupVersionKind(schema.GroupVersionKind{
+					Group:   "apps",
+					Version: "v1",
+					Kind:    "Deployment",
+				})
+				expected.SetNamespace("test")
+				expected.SetName("nginx")
+				expected.SetLabels(map[string]string{
+					argocdInstanceLabel: "my-app",
+				})
+
+				list.Items = append(list.Items, expected)
+				return list
+			},
+			expectedPass: 1,
+		},
+		{
+			name: "A resource with an invalid argocd tracking-id annotation is not ignored",
+			filters: func() []FilterFunc {
+				applications := []unstructured.Unstructured{
+					argocdApplication("my-app", "argocd", []map[string]any{
+						{
+							"group":     "apps",
+							"kind":      "Deployment",
+							"namespace": "test",
+							"name":      "nginx",
+						},
+					}),
+				}
+
+				return []FilterFunc{IgnoreIfApplicationFound(applications)}
+			},
+			list: func() *unstructured.UnstructuredList {
+				list := &unstructured.UnstructuredList{}
+				expected := unstructured.Unstructured{}
+				expected.SetGroupVersionKind(schema.GroupVersionKind{
+					Group:   "apps",
+					Version: "v1",
+					Kind:    "Deployment",
+				})
+				expected.SetNamespace("test")
+				expected.SetName("nginx")
+				expected.SetAnnotations(map[string]string{
+					argocdTrackingIDAnnotation: "not-a-valid-tracking-id",
+				})
+
+				list.Items = append(list.Items, expected)
+				return list
+			},
+			expectedPass: 1,
+		},
+		{
+			name: "A resource of the core api group tracked via the argocd tracking-id annotation is ignored",
+			filters: func() []FilterFunc {
+				applications := []unstructured.Unstructured{
+					argocdApplication("my-app", "argocd", []map[string]any{
+						{
+							"kind":      "ConfigMap",
+							"namespace": "test",
+							"name":      "config",
+						},
+					}),
+				}
+
+				return []FilterFunc{IgnoreIfApplicationFound(applications)}
+			},
+			list: func() *unstructured.UnstructuredList {
+				list := &unstructured.UnstructuredList{}
+				notExpected := unstructured.Unstructured{}
+				notExpected.SetGroupVersionKind(schema.GroupVersionKind{
+					Group:   "",
+					Version: "v1",
+					Kind:    "ConfigMap",
+				})
+				notExpected.SetNamespace("test")
+				notExpected.SetName("config")
+				notExpected.SetAnnotations(map[string]string{
+					argocdTrackingIDAnnotation: "my-app:/ConfigMap:test/config",
+				})
+
+				list.Items = append(list.Items, notExpected)
+				return list
+			},
+			expectedPass: 0,
+		},
+		{
+			name: "A resource tracked via a namespaced argocd tracking-id annotation is ignored",
+			filters: func() []FilterFunc {
+				applications := []unstructured.Unstructured{
+					argocdApplication("my-app", "gitops", []map[string]any{
+						{
+							"group":     "apps",
+							"kind":      "Deployment",
+							"namespace": "test",
+							"name":      "nginx",
+						},
+					}),
+				}
+
+				return []FilterFunc{IgnoreIfApplicationFound(applications)}
+			},
+			list: func() *unstructured.UnstructuredList {
+				list := &unstructured.UnstructuredList{}
+				notExpected := unstructured.Unstructured{}
+				notExpected.SetGroupVersionKind(schema.GroupVersionKind{
+					Group:   "apps",
+					Version: "v1",
+					Kind:    "Deployment",
+				})
+				notExpected.SetNamespace("test")
+				notExpected.SetName("nginx")
+				notExpected.SetAnnotations(map[string]string{
+					argocdTrackingIDAnnotation: "gitops/my-app:apps/Deployment:test/nginx",
+				})
+
+				list.Items = append(list.Items, notExpected)
+				return list
+			},
+			expectedPass: 0,
+		},
+		{
+			name: "A resource claimed by a kustomization and an argocd application is ignored and reported as dual claimed",
+			filters: func() []FilterFunc {
+				kustomizations := &ksapi.KustomizationList{}
+				ks := ksapi.Kustomization{}
+				ks.SetName("release")
+				ks.SetNamespace("test")
+				ks.Status.Inventory = &ksapi.ResourceInventory{
+					Entries: []ksapi.ResourceRef{
+						{
+							ID: "test_config__ConfigMap",
+						},
+					},
+				}
+				kustomizations.Items = append(kustomizations.Items, ks)
+
+				applications := []unstructured.Unstructured{
+					argocdApplication("my-app", "argocd", []map[string]any{
+						{
+							"kind":      "ConfigMap",
+							"namespace": "test",
+							"name":      "config",
+						},
+					}),
+				}
+
+				return []FilterFunc{
+					IgnoreIfKustomizationFound(kustomizations.Items),
+					IgnoreIfApplicationFound(applications),
+				}
+			},
+			list: func() *unstructured.UnstructuredList {
+				list := &unstructured.UnstructuredList{}
+				notExpected := unstructured.Unstructured{}
+				notExpected.SetGroupVersionKind(schema.GroupVersionKind{
+					Group:   "",
+					Version: "v1",
+					Kind:    "ConfigMap",
+				})
+				notExpected.SetNamespace("test")
+				notExpected.SetName("config")
+				notExpected.SetLabels(map[string]string{
+					fluxKustomizeNameLabel:      "release",
+					fluxKustomizeNamespaceLabel: "test",
+					argocdInstanceLabel:         "my-app",
+				})
+
+				list.Items = append(list.Items, notExpected)
+				return list
+			},
+			expectedPass:       0,
+			expectedDualClaims: 1,
+		},
 	}
 
 	for _, test := range tests {
@@ -465,6 +741,96 @@ func TestDiscovery(t *testing.T) {
 			err := discovery.Discover(t.Context(), test.list(), ch)
 			require.NoError(t, err)
 			assert.Equal(t, test.expectedPass, len(ch))
+			assert.Equal(t, test.expectedDualClaims, len(discovery.DualClaims()))
+		})
+	}
+}
+
+func TestParseTrackingID(t *testing.T) {
+	tests := []struct {
+		name       string
+		trackingID string
+		expected   applicationRef
+		valid      bool
+	}{
+		{
+			name:       "application without namespace prefix",
+			trackingID: "my-app:apps/Deployment:test/nginx",
+			expected:   applicationRef{name: "my-app"},
+			valid:      true,
+		},
+		{
+			name:       "application with namespace prefix",
+			trackingID: "gitops/my-app:apps/Deployment:test/nginx",
+			expected:   applicationRef{namespace: "gitops", name: "my-app"},
+			valid:      true,
+		},
+		{
+			name:       "resource of the core api group",
+			trackingID: "my-app:/ConfigMap:test/config",
+			expected:   applicationRef{name: "my-app"},
+			valid:      true,
+		},
+		{
+			name:       "cluster scoped resource",
+			trackingID: "my-app:rbac.authorization.k8s.io/ClusterRole:/cluster-admin",
+			expected:   applicationRef{name: "my-app"},
+			valid:      true,
+		},
+		{
+			name:       "empty value",
+			trackingID: "",
+			valid:      false,
+		},
+		{
+			name:       "no separators",
+			trackingID: "garbage",
+			valid:      false,
+		},
+		{
+			name:       "missing resource segment",
+			trackingID: "my-app:apps/Deployment",
+			valid:      false,
+		},
+		{
+			name:       "too many segments",
+			trackingID: "my-app:apps/Deployment:test/nginx:extra",
+			valid:      false,
+		},
+		{
+			name:       "empty application name",
+			trackingID: ":apps/Deployment:test/nginx",
+			valid:      false,
+		},
+		{
+			name:       "empty kind",
+			trackingID: "my-app:apps/:test/nginx",
+			valid:      false,
+		},
+		{
+			name:       "empty resource name",
+			trackingID: "my-app:apps/Deployment:test/",
+			valid:      false,
+		},
+		{
+			name:       "missing resource namespace separator",
+			trackingID: "my-app:apps/Deployment:nginx",
+			valid:      false,
+		},
+		{
+			name:       "too many application segments",
+			trackingID: "a/b/c:apps/Deployment:test/nginx",
+			valid:      false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ref, valid := parseTrackingID(test.trackingID)
+			assert.Equal(t, test.valid, valid)
+			if test.valid {
+				assert.Equal(t, test.expected, ref)
+			}
 		})
 	}
 }
